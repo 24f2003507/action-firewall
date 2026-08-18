@@ -1,9 +1,9 @@
-import html
+import json
 import re
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 
 app = FastAPI()
@@ -57,10 +57,13 @@ def is_unsafe_html(html_text: str) -> bool:
 
 
 @app.post("/action-firewall")
-def action_firewall(request: dict[str, Any]):
-    # 1. Top-level schema
+async def action_firewall(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return action_block("INVALID_SCHEMA")
 
-    if not isinstance(request, dict):
+    if not isinstance(data, dict):
         return action_block("INVALID_SCHEMA")
 
     required = {
@@ -69,29 +72,29 @@ def action_firewall(request: dict[str, Any]):
         "action",
     }
 
-    if not required.issubset(request.keys()):
+    if not required.issubset(data.keys()):
         return action_block("INVALID_SCHEMA")
 
-    if not isinstance(request["provenance"], str):
+    if not isinstance(data["provenance"], str):
         return action_block("INVALID_SCHEMA")
 
-    if request["provenance"] not in {"trusted", "untrusted"}:
+    if data["provenance"] not in {"trusted", "untrusted"}:
         return action_block("INVALID_SCHEMA")
 
-    if type(request["humanApproved"]) is not bool:
+    if type(data["humanApproved"]) is not bool:
         return action_block("INVALID_SCHEMA")
 
-    if "untrustedContent" in request:
+    if "untrustedContent" in data:
         if (
-            request["untrustedContent"] is not None
-            and not isinstance(request["untrustedContent"], str)
+            data["untrustedContent"] is not None
+            and not isinstance(data["untrustedContent"], str)
         ):
             return action_block("INVALID_SCHEMA")
 
-    if not isinstance(request["action"], dict):
+    if not isinstance(data["action"], dict):
         return action_block("INVALID_SCHEMA")
 
-    action = request["action"]
+    action = data["action"]
 
     if "tool" not in action or "args" not in action:
         return action_block("INVALID_SCHEMA")
@@ -102,16 +105,12 @@ def action_firewall(request: dict[str, Any]):
     if not isinstance(action["args"], dict):
         return action_block("INVALID_SCHEMA")
 
-    # 2. Tool allowlist
-
     tool = action["tool"]
 
     if tool not in ALLOWED_TOOLS:
         return action_block("TOOL_NOT_ALLOWED")
 
     args = action["args"]
-
-    # 3. Selected tool argument schema
 
     if tool == "search":
 
@@ -160,14 +159,10 @@ def action_firewall(request: dict[str, Any]):
         if not isinstance(args["html"], str):
             return action_block("INVALID_SCHEMA")
 
-    # 4. Tenant scope
-
     if tool == "lookup_record":
 
         if args["tenantId"] != ASSIGNED_TENANT:
             return action_block("TENANT_SCOPE")
-
-    # 5. Exact email-domain egress
 
     if tool == "send_email":
 
@@ -184,14 +179,8 @@ def action_firewall(request: dict[str, Any]):
         if domain != ALLOWED_EMAIL_DOMAIN:
             return action_block("EGRESS_DENIED")
 
-    # 6. Human approval
-
-    if tool == "send_email":
-
-        if request["humanApproved"] is not True:
+        if data["humanApproved"] is not True:
             return action_block("APPROVAL_REQUIRED")
-
-    # 7. HTML safety
 
     if tool == "render_html":
 
@@ -248,10 +237,13 @@ def terraform_approve():
 
 
 @app.post("/terraform/plan")
-def terraform_plan(request: dict[str, Any]):
-    # 1. Request and nested-object types/schema
+async def terraform_plan(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return terraform_reject("INVALID_PLAN")
 
-    if not isinstance(request, dict):
+    if not isinstance(data, dict):
         return terraform_reject("INVALID_PLAN")
 
     required_top_level = {
@@ -262,31 +254,28 @@ def terraform_plan(request: dict[str, Any]):
         "resource",
     }
 
-    if not required_top_level.issubset(request.keys()):
+    if not required_top_level.issubset(data.keys()):
         return terraform_reject("INVALID_PLAN")
 
-    if not isinstance(request["environment"], str):
+    if not isinstance(data["environment"], str):
         return terraform_reject("INVALID_PLAN")
 
-    if not isinstance(request["state"], dict):
+    if not isinstance(data["state"], dict):
         return terraform_reject("INVALID_PLAN")
 
-    if not isinstance(request["providerVersion"], str):
+    if not isinstance(data["providerVersion"], str):
         return terraform_reject("INVALID_PLAN")
 
-    if type(request["destroyApproved"]) is not bool:
+    if type(data["destroyApproved"]) is not bool:
         return terraform_reject("INVALID_PLAN")
 
-    if not isinstance(request["resource"], dict):
+    if not isinstance(data["resource"], dict):
         return terraform_reject("INVALID_PLAN")
 
-    state = request["state"]
-    resource = request["resource"]
+    state = data["state"]
+    resource = data["resource"]
 
-    if "backend" not in state:
-        return terraform_reject("INVALID_PLAN")
-
-    if "locked" not in state:
+    if "backend" not in state or "locked" not in state:
         return terraform_reject("INVALID_PLAN")
 
     if not isinstance(state["backend"], str):
@@ -329,12 +318,8 @@ def terraform_plan(request: dict[str, Any]):
     if resource["action"] not in ALLOWED_ACTIONS:
         return terraform_reject("INVALID_PLAN")
 
-    # 2. Environment
-
-    if request["environment"] != PRODUCTION_WORKSPACE:
+    if data["environment"] != PRODUCTION_WORKSPACE:
         return terraform_reject("ENVIRONMENT_MISMATCH")
-
-    # 3. State
 
     if state["backend"] not in ALLOWED_BACKENDS:
         return terraform_reject("STATE_UNSAFE")
@@ -342,16 +327,12 @@ def terraform_plan(request: dict[str, Any]):
     if state["locked"] is not True:
         return terraform_reject("STATE_UNSAFE")
 
-    # 4. Provider pinning
-
-    if request["providerVersion"] not in {
+    if data["providerVersion"] not in {
         "6.2.1",
         "= 6.2.1",
         "~> 6.0",
     }:
         return terraform_reject("UNPINNED_PROVIDER")
-
-    # 5. Required labels
 
     labels = resource["labels"]
 
@@ -363,8 +344,6 @@ def terraform_plan(request: dict[str, Any]):
         if labels[key] != expected_value:
             return terraform_reject("MISSING_LABELS")
 
-    # 6. Secret
-
     secret = resource["secret"]
 
     if secret is not None:
@@ -375,19 +354,15 @@ def terraform_plan(request: dict[str, Any]):
         if len(secret) <= len("secret://"):
             return terraform_reject("PLAINTEXT_SECRET")
 
-    # 7. Destructive deletes
-
     if resource["action"] == "delete":
 
         if resource["type"] in DESTRUCTIVE_RESOURCE_TYPES:
 
-            if request["destroyApproved"] is not True:
+            if data["destroyApproved"] is not True:
                 return terraform_reject("DELETE_NOT_APPROVED")
 
-    # 8. Force destroy
-
     if (
-        request["environment"] == PRODUCTION_WORKSPACE
+        data["environment"] == PRODUCTION_WORKSPACE
         and resource["type"] == "storage_bucket"
         and resource["forceDestroy"] is True
     ):
@@ -414,10 +389,6 @@ OUTPUT_CHANNELS = {
 }
 
 
-# ------------------------------------------------------------
-# Output response helpers
-# ------------------------------------------------------------
-
 def output_safe():
     return {
         "safe": True,
@@ -432,18 +403,39 @@ def output_unsafe(reason: str):
     }
 
 
-# ------------------------------------------------------------
-# Decode exactly once:
+# ============================================================
+# Decode exactly once
 #
+# Order:
 # 1. Percent escapes
-# 2. HTML numeric/named entities
+# 2. HTML entities
 # 3. \uXXXX escapes
-# ------------------------------------------------------------
+# ============================================================
 
 def decode_once(value: str) -> str:
+
     decoded = unquote(value)
 
-    # Decode only the entities explicitly required by the task.
+    decoded = re.sub(
+        r"&#([0-9]+);",
+        lambda match: (
+            chr(int(match.group(1)))
+            if int(match.group(1)) <= 0x10FFFF
+            else match.group(0)
+        ),
+        decoded,
+    )
+
+    decoded = re.sub(
+        r"&#x([0-9a-fA-F]+);",
+        lambda match: (
+            chr(int(match.group(1), 16))
+            if int(match.group(1), 16) <= 0x10FFFF
+            else match.group(0)
+        ),
+        decoded,
+    )
+
     entity_map = {
         "&lt;": "<",
         "&gt;": ">",
@@ -452,28 +444,9 @@ def decode_once(value: str) -> str:
         "&amp;": "&",
     }
 
-    # Numeric decimal entities: &#NN;
-    decoded = re.sub(
-        r"&#([0-9]+);",
-        lambda match: chr(int(match.group(1)))
-        if int(match.group(1)) <= 0x10FFFF
-        else match.group(0),
-        decoded,
-    )
-
-    # Numeric hexadecimal entities: &#xNN;
-    decoded = re.sub(
-        r"&#x([0-9a-fA-F]+);",
-        lambda match: chr(int(match.group(1), 16))
-        if int(match.group(1), 16) <= 0x10FFFF
-        else match.group(0),
-        decoded,
-    )
-
     for entity, replacement in entity_map.items():
         decoded = decoded.replace(entity, replacement)
 
-    # Decode literal \uXXXX escapes exactly once.
     decoded = re.sub(
         r"\\u([0-9a-fA-F]{4})",
         lambda match: chr(int(match.group(1), 16)),
@@ -483,9 +456,9 @@ def decode_once(value: str) -> str:
     return decoded
 
 
-# ------------------------------------------------------------
-# Dangerous scheme detection
-# ------------------------------------------------------------
+# ============================================================
+# Dangerous schemes
+# ============================================================
 
 DANGEROUS_SCHEME_PATTERN = re.compile(
     r"(?:javascript|data|vbscript)\s*:",
@@ -497,15 +470,16 @@ def contains_dangerous_scheme(text: str) -> bool:
     return DANGEROUS_SCHEME_PATTERN.search(text) is not None
 
 
-# ------------------------------------------------------------
+# ============================================================
 # URL extraction
-# ------------------------------------------------------------
+# ============================================================
 
 def extract_urls(channel: str, text: str) -> list[str]:
+
     urls = []
 
     if channel == "html":
-        # Only quoted src= and href= attributes.
+
         pattern = re.compile(
             r"""(?:src|href)\s*=\s*(["'])(.*?)\1""",
             re.IGNORECASE | re.DOTALL,
@@ -515,23 +489,23 @@ def extract_urls(channel: str, text: str) -> list[str]:
             urls.append(match.group(2))
 
     elif channel == "markdown":
-        # Extract the target inside ](...).
+
         pattern = re.compile(
             r"\]\(\s*([^)]+?)\s*\)",
             re.DOTALL,
         )
 
         for match in pattern.finditer(text):
+
             target = match.group(1).strip()
 
-            # Markdown allows angle brackets around URLs.
-            if len(target) >= 2 and target[0] == "<" and target[-1] == ">":
+            if (
+                len(target) >= 2
+                and target[0] == "<"
+                and target[-1] == ">"
+            ):
                 target = target[1:-1]
 
-            # Ignore optional markdown title after the URL.
-            # The common forms are:
-            # ](https://host/path "title")
-            # ](https://host/path 'title')
             title_match = re.match(
                 r"""(\S+)(?:\s+["'].*["'])?$""",
                 target,
@@ -544,23 +518,23 @@ def extract_urls(channel: str, text: str) -> list[str]:
             urls.append(target)
 
     elif channel == "url":
+
         urls.append(text.strip())
 
     return urls
 
 
-# ------------------------------------------------------------
+# ============================================================
 # URL scheme validation
-# ------------------------------------------------------------
+# ============================================================
 
-def url_has_dangerous_or_invalid_scheme(url: str) -> bool:
+def url_has_dangerous_scheme(url: str) -> bool:
+
     stripped = url.strip()
 
-    # Explicit dangerous schemes.
     if contains_dangerous_scheme(stripped):
         return True
 
-    # Protocol-relative URLs are treated as HTTPS.
     parse_target = stripped
 
     if stripped.startswith("//"):
@@ -568,45 +542,50 @@ def url_has_dangerous_or_invalid_scheme(url: str) -> bool:
 
     parsed = urlparse(parse_target)
 
-    # A URL with an explicit scheme must be HTTP or HTTPS.
     if parsed.scheme:
-        if parsed.scheme.lower() not in {"http", "https"}:
+
+        if parsed.scheme.lower() not in {
+            "http",
+            "https",
+        }:
             return True
 
     return False
 
 
-# ------------------------------------------------------------
-# External-host validation
-# ------------------------------------------------------------
+# ============================================================
+# External URL validation
+# ============================================================
 
 def url_is_external(url: str) -> bool:
+
     stripped = url.strip()
 
-    # Relative URLs are allowed.
-    if stripped.startswith("/"):
-        # Important distinction:
-        # //host/path is protocol-relative and therefore absolute.
-        if stripped.startswith("//"):
-            parsed = urlparse("https:" + stripped)
-        else:
-            return False
+    if stripped.startswith("//"):
+
+        parsed = urlparse(
+            "https:" + stripped
+        )
+
+    elif stripped.startswith("/"):
+
+        return False
+
     else:
+
         parsed = urlparse(stripped)
 
-    # No hostname means it is a relative reference.
     hostname = parsed.hostname
 
     if hostname is None:
         return False
 
-    # Exact hostname match only.
     return hostname.lower() not in ALLOWED_EXTERNAL_HOSTS
 
 
-# ------------------------------------------------------------
+# ============================================================
 # HTML checks
-# ------------------------------------------------------------
+# ============================================================
 
 SCRIPT_TAG_PATTERN = re.compile(
     r"<\s*(?:script|iframe|object|embed)\b",
@@ -619,11 +598,12 @@ EVENT_HANDLER_PATTERN = re.compile(
 )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # SQL checks
-# ------------------------------------------------------------
+# ============================================================
 
 def contains_sql_metachar(text: str) -> bool:
+
     if "'" in text:
         return True
 
@@ -639,21 +619,33 @@ def contains_sql_metachar(text: str) -> bool:
     if "/*" in text:
         return True
 
-    if re.search(r"\bunion\b", text, re.IGNORECASE):
+    if re.search(
+        r"\bunion\b",
+        text,
+        re.IGNORECASE,
+    ):
         return True
 
-    if re.search(r"\bor\s+1\s*=\s*1\b", text, re.IGNORECASE):
+    if re.search(
+        r"\bor\s+1\s*=\s*1\b",
+        text,
+        re.IGNORECASE,
+    ):
         return True
 
     return False
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Shell checks
-# ------------------------------------------------------------
+# ============================================================
 
 def contains_shell_metachar(text: str) -> bool:
-    if any(character in text for character in ";&|`<>"):
+
+    if any(
+        character in text
+        for character in ";&|`<>"
+    ):
         return True
 
     if "$(" in text:
@@ -665,15 +657,14 @@ def contains_shell_metachar(text: str) -> bool:
     return False
 
 
-# ------------------------------------------------------------
-# Apply channel rules to a string.
-#
-# IMPORTANT:
-# This function does NOT perform encoded-payload checking.
-# The caller handles that separately so decoding happens once.
-# ------------------------------------------------------------
+# ============================================================
+# Channel checks
+# ============================================================
 
-def check_channel(channel: str, text: str) -> str | None:
+def check_channel(
+    channel: str,
+    text: str,
+) -> str | None:
 
     if channel == "html":
 
@@ -690,11 +681,14 @@ def check_channel(channel: str, text: str) -> str | None:
             return "DANGEROUS_SCHEME"
 
         # 4. EXTERNAL_EXFIL
-        urls = extract_urls("html", text)
+        urls = extract_urls(
+            "html",
+            text,
+        )
 
         for url in urls:
 
-            if url_has_dangerous_or_invalid_scheme(url):
+            if url_has_dangerous_scheme(url):
                 return "DANGEROUS_SCHEME"
 
             if url_is_external(url):
@@ -709,11 +703,14 @@ def check_channel(channel: str, text: str) -> str | None:
             return "DANGEROUS_SCHEME"
 
         # 2. EXTERNAL_EXFIL
-        urls = extract_urls("markdown", text)
+        urls = extract_urls(
+            "markdown",
+            text,
+        )
 
         for url in urls:
 
-            if url_has_dangerous_or_invalid_scheme(url):
+            if url_has_dangerous_scheme(url):
                 return "DANGEROUS_SCHEME"
 
             if url_is_external(url):
@@ -728,11 +725,14 @@ def check_channel(channel: str, text: str) -> str | None:
             return "DANGEROUS_SCHEME"
 
         # 2. EXTERNAL_EXFIL
-        urls = extract_urls("url", text)
+        urls = extract_urls(
+            "url",
+            text,
+        )
 
         for url in urls:
 
-            if url_has_dangerous_or_invalid_scheme(url):
+            if url_has_dangerous_scheme(url):
                 return "DANGEROUS_SCHEME"
 
             if url_is_external(url):
@@ -757,28 +757,37 @@ def check_channel(channel: str, text: str) -> str | None:
     return "INVALID_SCHEMA"
 
 
-# ------------------------------------------------------------
+# ============================================================
 # /sanitize-output
-# ------------------------------------------------------------
+# ============================================================
 
 @app.post("/sanitize-output")
-def sanitize_output(request: Any):
+async def sanitize_output(request: Request):
 
-    # ========================================================
+    # Read the raw JSON ourselves so that even invalid JSON
+    # shapes can receive a 2xx JSON response.
+
+    try:
+        raw_body = await request.body()
+        data = json.loads(raw_body)
+    except Exception:
+        return output_unsafe("INVALID_SCHEMA")
+
+    # --------------------------------------------------------
     # RULE 1 — INVALID_SCHEMA
-    # ========================================================
+    # --------------------------------------------------------
 
-    if not isinstance(request, dict):
+    if not isinstance(data, dict):
         return output_unsafe("INVALID_SCHEMA")
 
-    if "channel" not in request:
+    if "channel" not in data:
         return output_unsafe("INVALID_SCHEMA")
 
-    if "output" not in request:
+    if "output" not in data:
         return output_unsafe("INVALID_SCHEMA")
 
-    channel = request["channel"]
-    output = request["output"]
+    channel = data["channel"]
+    output = data["output"]
 
     if channel not in OUTPUT_CHANNELS:
         return output_unsafe("INVALID_SCHEMA")
@@ -789,35 +798,35 @@ def sanitize_output(request: Any):
     if len(output) > 20000:
         return output_unsafe("INVALID_SCHEMA")
 
-    # ========================================================
+    # --------------------------------------------------------
     # RULE 2 — ENCODED_PAYLOAD
-    #
-    # Decode exactly once. If the decoded version differs
-    # from the original AND the decoded version would trigger
-    # any channel rule, return ENCODED_PAYLOAD.
-    # ========================================================
+    # --------------------------------------------------------
 
     decoded = decode_once(output)
 
     if decoded != output:
 
-        decoded_reason = check_channel(channel, decoded)
+        decoded_reason = check_channel(
+            channel,
+            decoded,
+        )
 
         if decoded_reason is not None:
-            return output_unsafe("ENCODED_PAYLOAD")
+            return output_unsafe(
+                "ENCODED_PAYLOAD"
+            )
 
-    # ========================================================
-    # RULE 3 — Apply channel rules to ORIGINAL output
-    # ========================================================
+    # --------------------------------------------------------
+    # RULE 3 — Original output
+    # --------------------------------------------------------
 
-    reason = check_channel(channel, output)
+    reason = check_channel(
+        channel,
+        output,
+    )
 
     if reason is not None:
         return output_unsafe(reason)
-
-    # ========================================================
-    # Everything passed
-    # ========================================================
 
     return output_safe()
 
