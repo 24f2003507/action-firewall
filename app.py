@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -159,11 +160,13 @@ async def action_firewall(request: Request):
         if not isinstance(args["html"], str):
             return action_block("INVALID_SCHEMA")
 
+    # Tenant scope
     if tool == "lookup_record":
 
         if args["tenantId"] != ASSIGNED_TENANT:
             return action_block("TENANT_SCOPE")
 
+    # Exact email domain
     if tool == "send_email":
 
         recipient = args["to"]
@@ -182,6 +185,7 @@ async def action_firewall(request: Request):
         if data["humanApproved"] is not True:
             return action_block("APPROVAL_REQUIRED")
 
+    # HTML safety
     if tool == "render_html":
 
         if is_unsafe_html(args["html"]):
@@ -238,6 +242,7 @@ def terraform_approve():
 
 @app.post("/terraform/plan")
 async def terraform_plan(request: Request):
+
     try:
         data = await request.json()
     except Exception:
@@ -275,7 +280,10 @@ async def terraform_plan(request: Request):
     state = data["state"]
     resource = data["resource"]
 
-    if "backend" not in state or "locked" not in state:
+    if "backend" not in state:
+        return terraform_reject("INVALID_PLAN")
+
+    if "locked" not in state:
         return terraform_reject("INVALID_PLAN")
 
     if not isinstance(state["backend"], str):
@@ -318,15 +326,18 @@ async def terraform_plan(request: Request):
     if resource["action"] not in ALLOWED_ACTIONS:
         return terraform_reject("INVALID_PLAN")
 
+    # Environment
     if data["environment"] != PRODUCTION_WORKSPACE:
         return terraform_reject("ENVIRONMENT_MISMATCH")
 
+    # State
     if state["backend"] not in ALLOWED_BACKENDS:
         return terraform_reject("STATE_UNSAFE")
 
     if state["locked"] is not True:
         return terraform_reject("STATE_UNSAFE")
 
+    # Provider
     if data["providerVersion"] not in {
         "6.2.1",
         "= 6.2.1",
@@ -334,6 +345,7 @@ async def terraform_plan(request: Request):
     }:
         return terraform_reject("UNPINNED_PROVIDER")
 
+    # Labels
     labels = resource["labels"]
 
     for key, expected_value in REQUIRED_LABELS.items():
@@ -344,6 +356,7 @@ async def terraform_plan(request: Request):
         if labels[key] != expected_value:
             return terraform_reject("MISSING_LABELS")
 
+    # Secret
     secret = resource["secret"]
 
     if secret is not None:
@@ -354,6 +367,7 @@ async def terraform_plan(request: Request):
         if len(secret) <= len("secret://"):
             return terraform_reject("PLAINTEXT_SECRET")
 
+    # Destructive delete
     if resource["action"] == "delete":
 
         if resource["type"] in DESTRUCTIVE_RESOURCE_TYPES:
@@ -361,6 +375,7 @@ async def terraform_plan(request: Request):
             if data["destroyApproved"] is not True:
                 return terraform_reject("DELETE_NOT_APPROVED")
 
+    # Force destroy
     if (
         data["environment"] == PRODUCTION_WORKSPACE
         and resource["type"] == "storage_bucket"
@@ -403,19 +418,12 @@ def output_unsafe(reason: str):
     }
 
 
-# ============================================================
-# Decode exactly once
-#
-# Order:
-# 1. Percent escapes
-# 2. HTML entities
-# 3. \uXXXX escapes
-# ============================================================
-
 def decode_once(value: str) -> str:
 
+    # 1. Percent escapes
     decoded = unquote(value)
 
+    # 2a. Decimal HTML entities
     decoded = re.sub(
         r"&#([0-9]+);",
         lambda match: (
@@ -426,6 +434,7 @@ def decode_once(value: str) -> str:
         decoded,
     )
 
+    # 2b. Hex HTML entities
     decoded = re.sub(
         r"&#x([0-9a-fA-F]+);",
         lambda match: (
@@ -436,6 +445,7 @@ def decode_once(value: str) -> str:
         decoded,
     )
 
+    # 2c. Named entities explicitly required by task
     entity_map = {
         "&lt;": "<",
         "&gt;": ">",
@@ -447,6 +457,7 @@ def decode_once(value: str) -> str:
     for entity, replacement in entity_map.items():
         decoded = decoded.replace(entity, replacement)
 
+    # 3. Unicode escapes
     decoded = re.sub(
         r"\\u([0-9a-fA-F]{4})",
         lambda match: chr(int(match.group(1), 16)),
@@ -455,10 +466,6 @@ def decode_once(value: str) -> str:
 
     return decoded
 
-
-# ============================================================
-# Dangerous schemes
-# ============================================================
 
 DANGEROUS_SCHEME_PATTERN = re.compile(
     r"(?:javascript|data|vbscript)\s*:",
@@ -469,10 +476,6 @@ DANGEROUS_SCHEME_PATTERN = re.compile(
 def contains_dangerous_scheme(text: str) -> bool:
     return DANGEROUS_SCHEME_PATTERN.search(text) is not None
 
-
-# ============================================================
-# URL extraction
-# ============================================================
 
 def extract_urls(channel: str, text: str) -> list[str]:
 
@@ -524,10 +527,6 @@ def extract_urls(channel: str, text: str) -> list[str]:
     return urls
 
 
-# ============================================================
-# URL scheme validation
-# ============================================================
-
 def url_has_dangerous_scheme(url: str) -> bool:
 
     stripped = url.strip()
@@ -552,10 +551,6 @@ def url_has_dangerous_scheme(url: str) -> bool:
 
     return False
 
-
-# ============================================================
-# External URL validation
-# ============================================================
 
 def url_is_external(url: str) -> bool:
 
@@ -583,10 +578,6 @@ def url_is_external(url: str) -> bool:
     return hostname.lower() not in ALLOWED_EXTERNAL_HOSTS
 
 
-# ============================================================
-# HTML checks
-# ============================================================
-
 SCRIPT_TAG_PATTERN = re.compile(
     r"<\s*(?:script|iframe|object|embed)\b",
     re.IGNORECASE,
@@ -597,10 +588,6 @@ EVENT_HANDLER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-
-# ============================================================
-# SQL checks
-# ============================================================
 
 def contains_sql_metachar(text: str) -> bool:
 
@@ -636,10 +623,6 @@ def contains_sql_metachar(text: str) -> bool:
     return False
 
 
-# ============================================================
-# Shell checks
-# ============================================================
-
 def contains_shell_metachar(text: str) -> bool:
 
     if any(
@@ -657,10 +640,6 @@ def contains_shell_metachar(text: str) -> bool:
     return False
 
 
-# ============================================================
-# Channel checks
-# ============================================================
-
 def check_channel(
     channel: str,
     text: str,
@@ -668,19 +647,15 @@ def check_channel(
 
     if channel == "html":
 
-        # 1. SCRIPT_TAG
         if SCRIPT_TAG_PATTERN.search(text):
             return "SCRIPT_TAG"
 
-        # 2. EVENT_HANDLER
         if EVENT_HANDLER_PATTERN.search(text):
             return "EVENT_HANDLER"
 
-        # 3. DANGEROUS_SCHEME
         if contains_dangerous_scheme(text):
             return "DANGEROUS_SCHEME"
 
-        # 4. EXTERNAL_EXFIL
         urls = extract_urls(
             "html",
             text,
@@ -698,11 +673,9 @@ def check_channel(
 
     if channel == "markdown":
 
-        # 1. DANGEROUS_SCHEME
         if contains_dangerous_scheme(text):
             return "DANGEROUS_SCHEME"
 
-        # 2. EXTERNAL_EXFIL
         urls = extract_urls(
             "markdown",
             text,
@@ -720,11 +693,9 @@ def check_channel(
 
     if channel == "url":
 
-        # 1. DANGEROUS_SCHEME
         if contains_dangerous_scheme(text):
             return "DANGEROUS_SCHEME"
 
-        # 2. EXTERNAL_EXFIL
         urls = extract_urls(
             "url",
             text,
@@ -757,15 +728,8 @@ def check_channel(
     return "INVALID_SCHEMA"
 
 
-# ============================================================
-# /sanitize-output
-# ============================================================
-
 @app.post("/sanitize-output")
 async def sanitize_output(request: Request):
-
-    # Read the raw JSON ourselves so that even invalid JSON
-    # shapes can receive a 2xx JSON response.
 
     try:
         raw_body = await request.body()
@@ -773,10 +737,7 @@ async def sanitize_output(request: Request):
     except Exception:
         return output_unsafe("INVALID_SCHEMA")
 
-    # --------------------------------------------------------
-    # RULE 1 — INVALID_SCHEMA
-    # --------------------------------------------------------
-
+    # Rule 1
     if not isinstance(data, dict):
         return output_unsafe("INVALID_SCHEMA")
 
@@ -798,10 +759,7 @@ async def sanitize_output(request: Request):
     if len(output) > 20000:
         return output_unsafe("INVALID_SCHEMA")
 
-    # --------------------------------------------------------
-    # RULE 2 — ENCODED_PAYLOAD
-    # --------------------------------------------------------
-
+    # Rule 2
     decoded = decode_once(output)
 
     if decoded != output:
@@ -816,10 +774,7 @@ async def sanitize_output(request: Request):
                 "ENCODED_PAYLOAD"
             )
 
-    # --------------------------------------------------------
-    # RULE 3 — Original output
-    # --------------------------------------------------------
-
+    # Rule 3
     reason = check_channel(
         channel,
         output,
@@ -832,7 +787,320 @@ async def sanitize_output(request: Request):
 
 
 # ============================================================
-# ROOT HEALTH CHECK
+# TASK 5 — OSINT CORROBORATION ENGINE
+# ============================================================
+
+OSINT_SUBJECT = "45vmvt.example"
+
+VALID_SOURCE_TYPES = {
+    "dns",
+    "ct_log",
+    "registry",
+    "archive",
+    "scan",
+}
+
+
+def osint_invalid():
+    return {
+        "verdict": "invalid",
+        "confidence": "low",
+        "corroboratingSources": [],
+    }
+
+
+def parse_timestamp(value: Any):
+    if not isinstance(value, str):
+        return None
+
+    try:
+        timestamp = value
+
+        # Convert Z to the format Python accepts consistently.
+        if timestamp.endswith("Z"):
+            timestamp = timestamp[:-1] + "+00:00"
+
+        parsed = datetime.fromisoformat(timestamp)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+
+    except Exception:
+        return None
+
+
+def is_fresh(
+    observed_at: datetime,
+    as_of: datetime,
+    staleness_days: float,
+) -> bool:
+
+    age_seconds = (
+        as_of - observed_at
+    ).total_seconds()
+
+    max_age_seconds = (
+        staleness_days * 24 * 60 * 60
+    )
+
+    return age_seconds <= max_age_seconds
+
+
+@app.post("/corroborate")
+async def corroborate(request: Request):
+
+    # ========================================================
+    # RULE 1 — INVALID
+    # ========================================================
+
+    try:
+        raw_body = await request.body()
+        data = json.loads(raw_body)
+    except Exception:
+        return osint_invalid()
+
+    if not isinstance(data, dict):
+        return osint_invalid()
+
+    # Claim must be an object.
+    claim = data.get("claim")
+
+    if not isinstance(claim, dict):
+        return osint_invalid()
+
+    # Only claim.value is explicitly required to be a string
+    # by the invalid rule.
+    claim_value = claim.get("value")
+
+    if not isinstance(claim_value, str):
+        return osint_invalid()
+
+    # asOf must exist and be parseable.
+    if "asOf" not in data:
+        return osint_invalid()
+
+    as_of = parse_timestamp(data["asOf"])
+
+    if as_of is None:
+        return osint_invalid()
+
+    # stalenessDays must be a number.
+    # bool is deliberately rejected because Python considers
+    # bool to be a subclass of int.
+    staleness_days = data.get("stalenessDays")
+
+    if (
+        isinstance(staleness_days, bool)
+        or not isinstance(
+            staleness_days,
+            (int, float),
+        )
+    ):
+        return osint_invalid()
+
+    # sources must be an array.
+    sources = data.get("sources")
+
+    if not isinstance(sources, list):
+        return osint_invalid()
+
+    # ========================================================
+    # Parse valid sources.
+    #
+    # Invalid sources are ignored entirely.
+    # ========================================================
+
+    valid_sources = []
+
+    for source in sources:
+
+        if not isinstance(source, dict):
+            continue
+
+        required_source_fields = {
+            "id",
+            "type",
+            "origin",
+            "observedAt",
+            "value",
+        }
+
+        if not required_source_fields.issubset(
+            source.keys()
+        ):
+            continue
+
+        if not isinstance(
+            source["id"],
+            str,
+        ):
+            continue
+
+        if not isinstance(
+            source["origin"],
+            str,
+        ):
+            continue
+
+        if not isinstance(
+            source["value"],
+            str,
+        ):
+            continue
+
+        if not isinstance(
+            source["observedAt"],
+            str,
+        ):
+            continue
+
+        if source["type"] not in VALID_SOURCE_TYPES:
+            continue
+
+        observed_at = parse_timestamp(
+            source["observedAt"]
+        )
+
+        if observed_at is None:
+            continue
+
+        valid_sources.append(
+            {
+                "source": source,
+                "observed_at": observed_at,
+            }
+        )
+
+    # ========================================================
+    # RULE 2 — CONTRADICTED
+    #
+    # Fresh authoritative source whose value differs from
+    # claim.value.
+    # ========================================================
+
+    contradicting_ids = []
+
+    for item in valid_sources:
+
+        source = item["source"]
+        observed_at = item["observed_at"]
+
+        if not is_fresh(
+            observed_at,
+            as_of,
+            staleness_days,
+        ):
+            continue
+
+        if source.get("authoritative") is True:
+
+            if source["value"] != claim_value:
+                contradicting_ids.append(
+                    source["id"]
+                )
+
+    if contradicting_ids:
+
+        contradicting_ids.sort()
+
+        return {
+            "verdict": "contradicted",
+            "confidence": "low",
+            "corroboratingSources": (
+                contradicting_ids
+            ),
+        }
+
+    # ========================================================
+    # RULE 3 — SUPPORTED
+    #
+    # Keep fresh sources whose value equals claim.
+    # Reduce to one representative per origin.
+    # Representative = lexicographically smallest id.
+    # ========================================================
+
+    matching_fresh_sources = []
+
+    for item in valid_sources:
+
+        source = item["source"]
+        observed_at = item["observed_at"]
+
+        if not is_fresh(
+            observed_at,
+            as_of,
+            staleness_days,
+        ):
+            continue
+
+        if source["value"] == claim_value:
+
+            matching_fresh_sources.append(
+                source
+            )
+
+    # One representative per origin.
+    representatives_by_origin = {}
+
+    for source in matching_fresh_sources:
+
+        origin = source["origin"]
+
+        if origin not in representatives_by_origin:
+
+            representatives_by_origin[origin] = source
+
+        else:
+
+            current = representatives_by_origin[origin]
+
+            if source["id"] < current["id"]:
+                representatives_by_origin[origin] = source
+
+    representatives = list(
+        representatives_by_origin.values()
+    )
+
+    if len(representatives) >= 2:
+
+        representative_ids = sorted(
+            source["id"]
+            for source in representatives
+        )
+
+        distinct_types = {
+            source["type"]
+            for source in representatives
+        }
+
+        if len(distinct_types) >= 2:
+            confidence = "high"
+        else:
+            confidence = "medium"
+
+        return {
+            "verdict": "supported",
+            "confidence": confidence,
+            "corroboratingSources": (
+                representative_ids
+            ),
+        }
+
+    # ========================================================
+    # RULE 4 — UNVERIFIED
+    # ========================================================
+
+    return {
+        "verdict": "unverified",
+        "confidence": "low",
+        "corroboratingSources": [],
+    }
+
+
+# ============================================================
+# HEALTH CHECK
 # ============================================================
 
 @app.get("/")
